@@ -1,280 +1,285 @@
-import os
-from pathlib import Path
-import logging
-logging.basicConfig(level=logging.INFO)
-import asyncio
-import sqlite3
-import random
-from datetime import date
-import os
+# -*- coding: utf-8 -*-
+# Polytech RPG — игровой Telegram-бот про студента и босса-сессию
+# aiogram 3.x + SQLite. Токен берётся из переменной окружения TELEGRAM_BOT_TOKEN.
 
-from aiogram import Bot, Dispatcher, types, F
+import os
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from aiogram.types import FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 
-# ================= НАСТРОЙКИ =================
-# ВСТАВЬ СЮДА СВОЙ НОВЫЙ ТОКЕН ОТ BOTFATHER
+# ---------------- НАСТРОЙКИ ----------------
+
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+
+# Папка для базы данных: на хостинге платформа подставит DATA_DIR=/app/data,
+# локально база создастся рядом с файлом.
+DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "dangers.db"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-# ================= БАЗА ДАННЫХ =================
-# Создаем папку для данных, если её нет
-data_dir = Path(os.environ.get("DATA_DIR", "."))
-data_dir.mkdir(parents=True, exist_ok=True)
-
-# Подключаемся к базе внутри этой папки
-db = sqlite3.connect(str(data_dir / "dangers.db"), check_same_thread=False)
-db.execute("""CREATE TABLE IF NOT EXISTS heroes(
-    user_id INTEGER PRIMARY KEY,
-    name TEXT,
-    xp INTEGER DEFAULT 0,
-    missed INTEGER DEFAULT 0)""")
-db.execute("""CREATE TABLE IF NOT EXISTS quests(
-    user_id INTEGER,
-    quest TEXT,
-    done INTEGER DEFAULT 0)""")
-db.execute("""CREATE TABLE IF NOT EXISTS boss(
-    id INTEGER PRIMARY KEY,
-    health INTEGER DEFAULT 100,
-    difficulty_multiplier REAL DEFAULT 1.0)""")
-db.execute("""CREATE TABLE IF NOT EXISTS inventory(
-    user_id INTEGER,
-    item TEXT)""")
-db.execute("""CREATE TABLE IF NOT EXISTS daily(
-    user_id INTEGER PRIMARY KEY,
-    last_date TEXT)""")
-
-# если босса ещё нет в базе — создаём
-if db.execute("SELECT 1 FROM boss").fetchone() is None:
-    db.execute("INSERT INTO boss (id, health, difficulty_multiplier) VALUES (1, 100, 1.0)")
+db = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+db.execute("""
+    CREATE TABLE IF NOT EXISTS players (
+        user_id INTEGER PRIMARY KEY,
+        name TEXT,
+        xp INTEGER DEFAULT 0,
+        level INTEGER DEFAULT 1,
+        skips INTEGER DEFAULT 0,
+        hp INTEGER DEFAULT 100,
+        has_shpargalka INTEGER DEFAULT 0,
+        has_energetik INTEGER DEFAULT 0,
+        stickers INTEGER DEFAULT 0,
+        last_bonus TEXT DEFAULT ''
+    )
+""")
 db.commit()
 
-# ================= ЗВАНИЯ =================
-def rank_of(xp: int) -> str:
-    if xp >= 500:
-        return "🏆 Легенда Политеха"
-    if xp >= 300:
-        return "🎓 Староста"
-    if xp >= 150:
-        return "📚 Отличник"
-    if xp >= 50:
-        return "✏️ Стипендиат"
-    return "🐣 Первокурсник"
+# ---------------- КЛАВИАТУРА ----------------
 
-# ================= КЛАВИАТУРА =================
-kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="👤 Мой персонаж"), KeyboardButton(text="🗺️ Карта Политеха")],
-        [KeyboardButton(text="⚔️ Зачистить зону"), KeyboardButton(text="💥 Атаковать босса")],
-        [KeyboardButton(text="💀 Пропустил пары"), KeyboardButton(text="🛒 Магазин")],
-        [KeyboardButton(text="🎁 Зачётка")],
-    ],
-    resize_keyboard=True
-)
+def main_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="👤 Мой персонаж"), KeyboardButton(text="🗺️ Карта Политеха")],
+            [KeyboardButton(text="💥 Атаковать босса"), KeyboardButton(text="💀 Пропустил пары")],
+            [KeyboardButton(text="🛒 Магазин"), KeyboardButton(text="🎁 Зачётка")],
+        ],
+        resize_keyboard=True
+    )
 
-# ================= /START =================
+# ---------------- ВСПОМОГАТЕЛЬНОЕ ----------------
+
+def get_player(user_id):
+    cur = db.execute("SELECT * FROM players WHERE user_id=?", (user_id,))
+    return cur.fetchone()
+
+def player_is_new(user_id):
+    return get_player(user_id) is None
+
+def add_xp(user_id, amount):
+    """Добавляет XP и автоматически повышает уровень."""
+    cur = db.execute("SELECT xp, level FROM players WHERE user_id=?", (user_id,))
+    xp, level = cur.fetchone()
+    xp += amount
+    while xp >= level * 100:
+        xp -= level * 100
+        level += 1
+        db.execute("UPDATE players SET xp=?, level=? WHERE user_id=?", (xp, level, user_id))
+        db.commit()
+        return level  # вернём новый уровень, чтобы поздравить
+    db.execute("UPDATE players SET xp=? WHERE user_id=?", (xp, user_id))
+    db.commit()
+    return None
+
+def rank_title(level):
+    ranks = {
+        1: "Новичок",
+        2: "Первокурсник",
+        3: "Студент",
+        4: "Отличник",
+        5: "Староста",
+        6: "Магистр Политеха",
+    }
+    return ranks.get(level, f"Легенда ({level} lvl)")
+
+# ---------------- КОМАНДЫ ----------------
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    uid = message.from_user.id
-    name = message.from_user.first_name or "Студент"
-    row = db.execute("SELECT user_id FROM heroes WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        db.execute("INSERT INTO heroes (user_id, name) VALUES (?, ?)", (uid, name))
+    if player_is_new(message.from_user.id):
+        name = message.from_user.first_name or "Студент"
+        db.execute("INSERT INTO players (user_id, name) VALUES (?, ?)", (message.from_user.id, name))
         db.commit()
         await message.answer(
-            f"Привет, {name}! Ты — студент Политеха. "
-            "Твоя цель: прокачать XP зачистками и повергнуть БОССА СЕССИИ! 💥\n\n"
-            "Но берегись: за каждый пропуск пар босс становится сильнее (+20 HP)."
+            f"Привет, {name}! Добро пожаловать в Polytech RPG! 🎓\n\n"
+            "Ты — студент Политеха. Твой главный враг — босс-сессия.\n"
+            "Каждый пропуск пар усиливает босса, а зачистки зон дают XP.\n\n"
+            "Выбирай действие в меню ниже 👇"
         )
     else:
-        await message.answer("С возвращением в Политех! 👋")
-    await message.answer("Выбирай действие:", reply_markup=kb)
+        name = get_player(message.from_user.id)[1]
+        await message.answer(f"С возвращением, {name}! Босс-сессия не дремлет. 👇")
 
-# ================= ПРОФИЛЬ =================
-@dp.message(F.text == "👤 Мой персонаж")
-async def cmd_profile(message: types.Message):
-    uid = message.from_user.id
-    row = db.execute("SELECT name, xp, missed FROM heroes WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        await message.answer("Сначала создай героя: /start")
+# ---------------- ПРОФИЛЬ ----------------
+
+@dp.message(lambda m: m.text == "👤 Мой персонаж")
+async def show_profile(message: types.Message):
+    p = get_player(message.from_user.id)
+    if p is None:
+        await message.answer("Сначала создай персонажа — напиши /start")
         return
-    name, xp, missed = row
-    inv = db.execute("SELECT item FROM inventory WHERE user_id=?", (uid,)).fetchall()
-    inv_text = ", ".join(SHOP[i][0] for i in inv) if inv else "пусто"
+    (_, name, xp, level, skips, hp, shp, ener, stick, _) = p
+    need = level * 100
+    inventory = []
+    if shp:
+        inventory.append("📜 Шпаргалка")
+    if ener:
+        inventory.append("⚡ Энергетик")
+    if stick:
+        inventory.append(f"🏷 Стикеры: {stick}")
+    inv_text = ", ".join(inventory) if inventory else "пусто"
     await message.answer(
         f"👤 {name}\n"
-        f"⭐ XP: {xp} — {rank_of(xp)}\n"
-        f"💀 Пропуски: {missed}\n"
+        f"🏅 Звание: {rank_title(level)} (уровень {level})\n"
+        f"✨ XP: {xp}/{need}\n"
+        f"❤️ HP: {hp}\n"
+        f"💀 Пропуски: {skips}\n"
         f"🎒 Инвентарь: {inv_text}"
     )
 
-# ================= ЗАЧИСТКА ЗОНЫ =================
-@dp.message(F.text == "⚔️ Зачистить зону")
-async def cmd_grind(message: types.Message):
-    uid = message.from_user.id
-    row = db.execute("SELECT xp FROM heroes WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        await message.answer("Сначала создай героя: /start")
-        return
-    # случайное событие: 10% шанс
-    if random.random() < 0.10:
-        db.execute("UPDATE heroes SET xp = xp + 30 WHERE user_id=?", (uid,))
-        db.commit()
-        await message.answer("🎉 Событие! Препод не пришёл на пару — свободный XP! +30 XP")
-        return
-    db.execute("UPDATE heroes SET xp = xp + 15 WHERE user_id=?", (uid,))
-    db.commit()
-    await message.answer("⚔️ Ты зачистил зону: конспекты, лабы, семинары. +15 XP")
+# ---------------- КАРТА (текстовая) ----------------
 
-# ================= ПРОПУСК ПАР =================
-@dp.message(F.text == "💀 Пропустил пары")
-async def cmd_miss(message: types.Message):
-    uid = message.from_user.id
-    row = db.execute("SELECT missed FROM heroes WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        await message.answer("Сначала создай героя: /start")
-        return
-    db.execute("UPDATE heroes SET missed = missed + 1 WHERE user_id=?", (uid,))
-    db.commit()
+@dp.message(lambda m: m.text == "🗺️ Карта Политеха")
+async def show_map(message: types.Message):
     await message.answer(
-        "💀 Ты пропустил пары. Босс Сессии стал сильнее (+20 HP)!\n"
-        "Не увлекайся — с 6+ пропусками XP за победу над боссом не дадут."
+        "🗺️ Карта Политеха:\n\n"
+        "🏛 Главный корпус — тут висит расписание (+5 XP за визит).\n"
+        "🏋️ Спортзал — зачистка даёт +15 XP.\n"
+        "📚 Библиотека — можно поднять HP.\n"
+        "🍜 Столовая — восстанавливает силы.\n"
+        "🧪 Лаборатория — случайное событие: бонус или штраф."
     )
 
-# ================= БОСС =================
-@dp.message(F.text == "💥 Атаковать босса")
-async def fight_boss(message: types.Message):
-    uid = message.from_user.id
-    hero_row = db.execute("SELECT xp, missed FROM heroes WHERE user_id=?", (uid,)).fetchone()
-    boss_row = db.execute("SELECT health, difficulty_multiplier FROM boss").fetchone()
+# ---------------- БОСС-СЕССИЯ ----------------
 
-    if not hero_row or not boss_row:
-        await message.answer("Сначала создай героя: /start")
+@dp.message(lambda m: m.text == "💥 Атаковать босса")
+async def attack_boss(message: types.Message):
+    p = get_player(message.from_user.id)
+    if p is None:
+        await message.answer("Сначала создай персонажа — напиши /start")
+        return
+    (_, name, xp, level, skips, hp, shp, ener, stick, _) = p
+
+    boss_hp = 50 + level * 20 + skips * 10
+    damage = 10 + level * 2
+    if shp:
+        damage += 15  # шпаргалка усиливает атаку
+
+    if skips >= 5:
+        await message.answer(
+            f"😱 Босс-сессия слишком силён: {skips} пропусков дают ему щит.\n"
+            "Сначала закрой долги — сходи на пару!"
+        )
         return
 
-    xp, missed = hero_row
-    base_health, multiplier = boss_row
+    if xp >= boss_hp:
+        gain = 30 + level * 10
+        db.execute("UPDATE players SET xp=0, skips=0 WHERE user_id=?", (message.from_user.id,))
+        db.commit()
+        new_level = add_xp(message.from_user.id, gain)
+        text = (
+            f"⚔️ Ты атакуешь босса-сессию на {damage} урона...\n"
+            f"🏆 ПОБЕДА! Босс повержен!\n"
+            f"Долги по пропускам обнулены, получено +{gain} XP!"
+        )
+        if new_level:
+            text += f"\n🎉 Новый уровень! Тебе присвоено звание: {rank_title(new_level)}"
+        await message.answer(text)
+    else:
+        db.execute("UPDATE players SET xp=? WHERE user_id=?", (max(0, xp - damage // 2), message.from_user.id))
+        db.commit()
+        await message.answer(
+            f"⚔️ Ты атакуешь босса-сессию на {damage} урона!\n"
+            f"🛡 HP босса: {boss_hp}/{boss_hp}\n"
+            f"Босс пока сильнее. Накопи XP и пробуй снова!\n"
+            f"(Твои XP: {max(0, xp - damage // 2)})"
+        )
 
-    # Считаем реальное здоровье босса
-    current_boss_hp = base_health + (missed * 20)
+# ---------------- ПРОПУСКИ ----------------
 
-    # Урон зависит от опыта героя (чем круче, тем сильнее бьёшь)
-    damage = max(5, xp // 10)
+@dp.message(lambda m: m.text == "💀 Пропустил пары")
+async def skip_classes(message: types.Message):
+    p = get_player(message.from_user.id)
+    if p is None:
+        await message.answer("Сначала создай персонажа — напиши /start")
+        return
+    db.execute("UPDATE players SET skips=skips+1 WHERE user_id=?", (message.from_user.id,))
+    db.commit()
+    p = get_player(message.from_user.id)
+    await message.answer(
+        f"💀 Ты пропустил пары...\n"
+        f"Босс-сессия стал сильнее! Теперь у него {50 + p[2] * 20 + p[4] * 10} HP.\n"
+        f"Пропусков всего: {p[4]}\n"
+        + ("⚠️ При 5 пропусках босс станет неуязвим — закрывай долги!" if p[4] >= 3 else "")
+    )
 
-    if damage >= current_boss_hp:
-        # ПОБЕДА!
-        # Проверка академической задолженности
-        if missed > 5:
-            db.execute("UPDATE boss SET health = 100")  # босс возрождается
-            db.commit()
-            await message.answer(
-                f"📉 Босс повержен, но... ты нарушил регламент!\n\n"
-                f"У тебя {missed} пропусков — академическая задолженность.\n"
-                f"Опыт не начисляется. Сначала закрой долги зачистками,\n"
-                f"потом возвращайся за наградой."
-            )
+# ---------------- ЗАЧЁТКА (ежедневная награда) ----------------
+
+@dp.message(lambda m: m.text == "🎁 Зачётка")
+async def daily_bonus(message: types.Message):
+    p = get_player(message.from_user.id)
+    if p is None:
+        await message.answer("Сначала создай персонажа — напиши /start")
+        return
+    today = datetime.now().strftime("%Y-%m-%d")
+    if p[9] == today:
+        await message.answer("🎁 Зачётка уже проставлена сегодня. Приходи завтра!")
+        return
+    db.execute("UPDATE players SET last_bonus=? WHERE user_id=?", (today, message.from_user.id))
+    db.commit()
+    new_level = add_xp(message.from_user.id, 20)
+    text = "🎁 Зачётка проставлена! +20 XP"
+    if new_level:
+        text += f"\n🎉 Новый уровень! Тебе присвоено звание: {rank_title(new_level)}"
+    await message.answer(text)
+
+# ---------------- МАГАЗИН ----------------
+
+@dp.message(lambda m: m.text == "🛒 Магазин")
+async def shop(message: types.Message):
+    p = get_player(message.from_user.id)
+    if p is None:
+        await message.answer("Сначала создай персонажа — напиши /start")
+        return
+    await message.answer(
+        "🛒 Магазин Политеха:\n\n"
+        "📜 Шпаргалка — 50 XP (+15 урона боссу)\n"
+        "⚡ Энергетик — 30 XP (один пропуск не засчитается)\n"
+        "🏷 Стикер Политеха — 20 XP (коллекционный предмет)\n\n"
+        "Чтобы купить, напиши: шпаргалка / энергетик / стикер"
+    )
+
+@dp.message(lambda m: m.text and m.text.lower() in ("шпаргалка", "энергетик", "стикер"))
+async def buy_item(message: types.Message):
+    p = get_player(message.from_user.id)
+    if p is None:
+        await message.answer("Сначала создай персонажа — напиши /start")
+        return
+    (_, name, xp, level, skips, hp, shp, ener, stick, _) = p
+    item = message.text.lower()
+
+    prices = {"шпаргалка": 50, "энергетик": 30, "стикер": 20}
+    if xp < prices[item]:
+        await message.answer(f"💸 Не хватает XP! Нужно {prices[item]}, у тебя {xp}.")
+        return
+
+    if item == "шпаргалка":
+        if shp:
+            await message.answer("📜 Шпаргалка уже есть в инвентаре!")
             return
-
-        bonus_xp = 100 + (missed * 10)  # бонус зависит от того, сколько долгов закрыл
-        db.execute("UPDATE heroes SET xp = xp + ?, missed = 0 WHERE user_id=?", (bonus_xp, uid))
-        db.execute("UPDATE boss SET health = 100")  # Сброс босса
-        db.commit()
-        await message.answer(
-            f"💥 КРИТИЧЕСКИЙ УДАР! БОСС ПОВЕРЖЕН! 💥\n\n"
-            f"Ты закрыл все долги и сдал сессию!\n"
-            f"+{bonus_xp} XP! Пропуски сброшены.\n"
-            f"Звание обновлено: {rank_of(xp + bonus_xp)}"
-        )
+        db.execute("UPDATE players SET xp=xp-50, has_shpargalka=1 WHERE user_id=?", (message.from_user.id,))
+    elif item == "энергетик":
+        if ener:
+            await message.answer("⚡ Энергетик уже есть! Выпей перед боем с боссом.")
+            return
+        db.execute("UPDATE players SET xp=xp-30, has_energetik=1 WHERE user_id=?", (message.from_user.id,))
     else:
-        # Промежуточный бой: запоминаем урон в базе
-        new_health = max(0, current_boss_hp - damage - int(missed * 20))
-        db.execute("UPDATE boss SET health = ?", (new_health,))
-        db.commit()
-        await message.answer(
-            f"⚔️ Ты нанёс {damage} урона!\n"
-            f"🩸 У босса осталось {current_boss_hp - damage} HP.\n\n"
-            "Продолжай зачищать зоны и качать XP — босс ждёт."
-        )
+        db.execute("UPDATE players SET xp=xp-20, stickers=stickers+1 WHERE user_id=?", (message.from_user.id,))
 
-# ================= МАГАЗИН =================
-SHOP = {
-    "cheat":   ("📌 Шпаргалка", 50, "спасает на экзамене"),
-    "energy":  ("☕ Энергетик", 30, "закрывает один пропуск"),
-    "sticker": ("🎫 Стикер Политеха", 100, "коллекционный флекс"),
-}
-
-@dp.message(F.text == "🛒 Магазин")
-async def cmd_shop(message: types.Message):
-    uid = message.from_user.id
-    row = db.execute("SELECT xp FROM heroes WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        await message.answer("Сначала создай героя: /start")
-        return
-    kb_inline = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{SHOP[k][0]} — {SHOP[k][1]} XP", callback_data=f"buy_{k}")]
-        for k in SHOP
-    ])
-    await message.answer(
-        f"🛒 Магазин студсовета\nТвой баланс: {row[0]} XP\nВыбирай товар:",
-        reply_markup=kb_inline
-    )
-
-@dp.callback_query(F.data.startswith("buy_"))
-async def buy_item(callback: types.CallbackQuery):
-    uid = callback.from_user.id
-    key = callback.data[4:]
-    name, price, desc = SHOP[key]
-    row = db.execute("SELECT xp FROM heroes WHERE user_id=?", (uid,)).fetchone()
-    if not row:
-        await callback.answer("Сначала создай героя: /start", show_alert=True)
-        return
-    if row[0] < price:
-        await callback.answer("Не хватает XP! Иди зачищать зоны.", show_alert=True)
-        return
-    db.execute("UPDATE heroes SET xp = xp - ? WHERE user_id=?", (price, uid))
-    db.execute("INSERT INTO inventory VALUES (?, ?)", (uid, key))
-    if key == "energy":
-        db.execute("UPDATE heroes SET missed = MAX(missed - 1, 0) WHERE user_id=?", (uid,))
     db.commit()
-    await callback.answer(f"Куплено: {name} — {desc}!")
+    await message.answer(f"✅ Куплено: {item.capitalize()}! Загляни в профиль, чтобы проверить инвентарь.")
 
-# ================= ЗАЧЁТКА (ЕЖЕДНЕВНАЯ НАГРАДА) =================
-@dp.message(F.text == "🎁 Зачётка")
-async def cmd_daily(message: types.Message):
-    uid = message.from_user.id
-    row = db.execute("SELECT last_date FROM daily WHERE user_id=?", (uid,)).fetchone()
-    today = date.today().isoformat()
-    if row and row[0] == today:
-        await message.answer("🎁 Зачётка сегодня уже получена. Приходи завтра!")
-        return
-    if row:
-        db.execute("UPDATE daily SET last_date=? WHERE user_id=?", (today, uid))
-    else:
-        db.execute("INSERT INTO daily VALUES (?, ?)", (uid, today))
-    db.execute("UPDATE heroes SET xp = xp + 20 WHERE user_id=?", (uid,))
-    db.commit()
-    await message.answer("🎁 Ты открыл зачётку: +20 XP! Возвращайся завтра.")
+# ---------------- ЗАПУСК ----------------
 
-# ================= КАРТА ПОЛИТЕХА =================
-@dp.message(F.text == "🗺️ Карта Политеха")
-async def cmd_map(message: types.Message):
-    path = "img/map.png"
-    if os.path.exists(path):
-        await message.answer_photo(
-            FSInputFile(path),
-            caption="🗺️ Карта Политеха. Зачисти зоны — и босс не пройдёт!"
-        )
-    else:
-        await message.answer(
-            "🗺️ Карта Политеха (файл img/map.png не найден — положи картинку в папку img)\n"
-            "Зачисти зоны — и босс не пройдёт!"
-        )
-
-# ================= ЗАПУСК =================
 async def main():
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    import asyncio
     asyncio.run(main())
