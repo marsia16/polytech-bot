@@ -13,8 +13,6 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 
 # ---------------- НАСТРОЙКИ ----------------
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-
 # Папка для базы данных: на хостинге платформа подставит DATA_DIR=/app/data,
 # локально база создастся рядом с файлом.
 DATA_DIR = Path(os.environ.get("DATA_DIR", "."))
