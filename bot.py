@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Polytech RPG — Telegram-бот для студента.
-Запуск: переменная окружения TELEGRAM_BOT_TOKEN должна содержать токен от @BotFather.
-База данных хранится в папке из переменной DATA_DIR (по умолчанию — рядом с ботом).
-"""
-
 import os
 import sqlite3
 import random
